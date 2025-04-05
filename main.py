@@ -4,24 +4,37 @@ import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
+import torch.nn.functional as F
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
-
 logging.basicConfig(level=logging.DEBUG)
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or specify exact origins for more security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY")
 if not PERSPECTIVE_API_KEY:
-    print("WARNING: No API key found! Check your .env file")
-    raise RuntimeError("Missing Perspective API key!")
+    raise RuntimeError("Missing Perspective API key.")
 
 PERSPECTIVE_API_URL = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
 
-# Removed 'severe_toxicity' from the list of valid attributes
 MODERATION_ATTRIBUTES = {
-    "TOXICITY": {}, "INSULT": {}, "IDENTITY_ATTACK": {}, "PROFANITY": {}, "THREAT": {}, "SEVERE_TOXICITY" : {}
+    "TOXICITY": {}, "INSULT": {}, "IDENTITY_ATTACK": {},
+    "PROFANITY": {}, "THREAT": {}, "SEVERE_TOXICITY": {}
 }
+
+tokenizer = AutoTokenizer.from_pretrained("mrm8488/t5-base-finetuned-sarcasm-twitter")
+model = AutoModelForSequenceClassification.from_pretrained("mrm8488/t5-base-finetuned-sarcasm-twitter")
 
 class CommentRequest(BaseModel):
     text: str
@@ -29,16 +42,18 @@ class CommentRequest(BaseModel):
 
 @app.get("/")
 def check_status():
-    print("Goodjob checking the status")
-    return {"message": "Service is running. Don't worry!"}
+    return {"message": "Service running."}
 
 @app.post("/analyze")
 def analyze_comment(comment: CommentRequest):
-    if comment.text.strip() == "":
-        raise HTTPException(status_code=400, detail="Text cannot be empty.")
+    text = comment.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text.")
 
     payload = {
-        "comment": {"text": comment.text}, "languages": ["en"], "requestedAttributes": MODERATION_ATTRIBUTES
+        "comment": {"text": text},
+        "languages": ["en"],
+        "requestedAttributes": MODERATION_ATTRIBUTES
     }
 
     try:
@@ -50,24 +65,31 @@ def analyze_comment(comment: CommentRequest):
         )
 
         if response.status_code != 200:
-            print(f"API ERROR: {response.text}")
             raise HTTPException(status_code=500, detail="Perspective API error.")
 
         data = response.json()
+        scores = {
+            attr: data.get("attributeScores", {}).get(attr.upper(), {}).get("summaryScore", {}).get("value", 0)
+            for attr in MODERATION_ATTRIBUTES.keys()
+        }
+        flagged = {attr: score for attr, score in scores.items() if score >= comment.threshold}
 
-        scores = {}
-        for attr in MODERATION_ATTRIBUTES.keys():
-            scores[attr] = data.get("attributeScores", {}).get(attr.upper(), {}).get("summaryScore", {}).get("value", 0)
-
-        flagged = {}
-        for attr, score in scores.items():
-            if score >= comment.threshold:
-                flagged[attr] = score
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = F.softmax(logits, dim=1)
+            sarcasm_score = probs[0][1].item()
+            is_sarcastic = sarcasm_score > 0.5
 
         return {
-            "text": comment.text, "scores": scores, "flagged": flagged, "is_toxic": "toxicity" in flagged
+            "text": text,
+            "scores": scores,
+            "flagged": flagged,
+            "is_toxic": "TOXICITY" in flagged,
+            "is_sarcastic": is_sarcastic,
+            "sarcasm_score": round(sarcasm_score, 4)
         }
 
     except requests.exceptions.RequestException as e:
-        logging.error("API connection error.")
-        raise HTTPException(status_code=500, detail="Failed to analyze comment.")
+        logging.error("Perspective API request failed.")
+        raise HTTPException(status_code=500, detail="Connection error.")
